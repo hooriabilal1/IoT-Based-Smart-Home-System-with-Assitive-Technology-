@@ -1,5 +1,5 @@
 # IoT-Based-Smart-Home-System-with-Assitive-Technology-
-# 🏠 IoT Smart Home Monitoring System (Elderly Assistive Tech)
+# IoT Smart Home Monitoring System (Elderly Assistive Tech)
 
 ## Overview
 A real-time IoT monitoring platform designed to assist elderly users, integrating:
