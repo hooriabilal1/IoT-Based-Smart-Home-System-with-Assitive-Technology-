@@ -17,12 +17,13 @@ A real-time IoT monitoring platform designed to assist elderly users, integratin
 - Accessibility-focused smart home monitoring UI
 
 ## Components
-|---|---|
-| Microcontroller | ESP32 (Arduino IDE) |
-| GUI | PyQt5 (Visual Studio / Python) |
-| Sensors | Temp/Humidity, PIR, 6-axis accelerometer |
-| Communication | Wi-Fi (no Bluetooth) |
-| Alerts | Twilio API (SMS) |
+- Microcontroller
+- ESP32
+- GUI (PyQt5 (Visual Studio / Python))
+- Honeywell Temp/Humidity Sensor
+- PIR Motion Sensor
+- Witmo 6-axis accelerometer
+- 2 layer PCB 
 
 ## Project Structure
 - `/Arduino` → ESP32 sensor firmware
