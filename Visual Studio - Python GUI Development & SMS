@@ -1,1 +1,393 @@
+import serial
+import sys
+import numpy as np
+import time
+import pandas as pd
+from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QGridLayout, QTabWidget
+from PyQt5 import QtGui
+from PyQt5.QtCore import QTimer, pyqtSignal, QThread
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+import struct
+from twilio.rest import Client
+from twilio.base.exceptions import TwilioRestException
 
+ESP32A_PORT = "COM5"
+ESP32B_PORT = "COM7"
+ACCEL_PORT = "COM14"
+BAUD_RATE = 115200
+
+TWILIO_ACCOUNT_SID = 'AC4b294be83571091eecbfeb788225834c'
+TWILIO_AUTH_TOKEN = 'b21c87c4bf93d2793add6862c79a0bab'
+TWILIO_PHONE_NUMBER = '+447883291081'
+TO_PHONE_NUMBER = 'Users Number Removed for Privacy'
+
+motionA = []
+motionB = []
+tempA = []
+tempB = []
+humidityA = []
+humidityB = []
+accel_data = []
+
+class SerialReaderThread(QThread):
+    dataSignal = pyqtSignal(str, str)
+
+    def __init__(self, com_port, device_name):
+        super().__init__()
+        self.com_port = com_port
+        self.device_name = device_name
+        self.running = True
+        self.ser = None
+
+    def run(self):
+        try:
+            self.ser = serial.Serial(self.com_port, BAUD_RATE, timeout=0.1)  # Reduced timeout
+            print(f"[SerialReaderThread] Connected to {self.com_port}")
+            while self.running:
+                data = self.ser.readline().decode(errors='ignore').strip()
+                if data:
+                    print(f"[Received] {data} from {self.com_port}")  # Debug print
+                    self.dataSignal.emit(data, self.device_name)
+        except serial.SerialException as e:
+            print(f"[Serial Error] Could not open port {self.com_port}: {e}")
+        except Exception as e:
+            print(f"[SerialReaderThread Error] {e}")
+
+    def stop(self):
+        self.running = False
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+        self.wait()
+
+def send_sms(body):
+    try:
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        message = client.messages.create(
+            body=body,
+            from_=TWILIO_PHONE_NUMBER,
+            to=TO_PHONE_NUMBER
+        )
+        print(f"[Twilio] SMS sent successfully: SID {message.sid}")
+    except TwilioRestException as e:
+        print(f"[Twilio Error] {e.code} - {e.msg}")
+    except Exception as e:
+        print(f"[Twilio Exception] An unexpected error occurred: {e}")
+
+class AccelerometerReaderThread(QThread):
+    sensorSignal = pyqtSignal(float, float, float, float, float, float, float, float)
+
+    def __init__(self, com_port):
+        super().__init__()
+        self.com_port = com_port
+        self.running = True
+        self.ser = None
+        self.last_sms_time = 0
+        self.SMS_COOLDOWN = 60
+
+    def run(self):
+        try:
+            self.ser = serial.Serial(self.com_port, BAUD_RATE, timeout=0.1)  # Reduced timeout
+            print(f"[AccelerometerReaderThread] Connected to {self.com_port}")
+            while self.running:
+                try:
+                    byte = self.ser.read(1)
+                    if byte == b'\x55':
+                        next_byte = self.ser.read(1)
+                        if next_byte == b'\x61':
+                            raw_data = b'\x55\x61' + self.ser.read(18)
+                            if len(raw_data) == 20:
+                                ax = struct.unpack('<h', raw_data[2:4])[0] / 32768.0 * 16.0 * 9.8
+                                ay = struct.unpack('<h', raw_data[4:6])[0] / 32768.0 * 16.0 * 9.8
+                                az = struct.unpack('<h', raw_data[6:8])[0] / 32768.0 * 16.0 * 9.8
+                                atotal = np.sqrt(ax**2 + ay**2 + az**2)
+                                roll = struct.unpack('<h', raw_data[14:16])[0] / 32768.0 * 180.0
+                                pitch = struct.unpack('<h', raw_data[16:18])[0] / 32768.0 * 180.0
+                                yaw = struct.unpack('<h', raw_data[18:20])[0] / 32768.0 * 180.0
+                                angle_total = np.sqrt(roll**2 + pitch**2 + yaw**2)
+
+                                print(f"[Sensor Data] Accel: Ax={ax:.2f}, Ay={ay:.2f}, Az={az:.2f}, Atotal={atotal:.2f} m/s² | "
+                                      f"Angles: Roll={roll:.2f}, Pitch={pitch:.2f}, Yaw={yaw:.2f}, AngleTotal={angle_total:.2f} °")
+
+                                current_time = time.time()
+                                if atotal > 15.0 and (current_time - self.last_sms_time >= self.SMS_COOLDOWN):
+                                    send_sms("Fall detected with individual, please check in on them")
+                                    self.last_sms_time = current_time
+
+                                self.sensorSignal.emit(ax, ay, az, atotal, roll, pitch, yaw, angle_total)
+                except Exception as e:
+                    print(f"[Sensor Error] {e}")
+                    time.sleep(0.01)
+        except serial.SerialException as e:
+            print(f"[Serial Error] Could not open port {self.com_port}: {e}")
+        except Exception as e:
+            print(f"[AccelerometerReaderThread Error] {e}")
+
+    def stop(self):
+        self.running = False
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+        self.wait()
+
+class MainWindow(QMainWindow):
+    def __init__(self, reader_a, reader_b, accel_reader):
+        super().__init__()
+
+        try:
+            self.setWindowTitle("Smart Home Platform")
+            self.resize(1000, 800)
+            self.setStyleSheet("background-color: rgb(0, 71, 104)")
+
+            font = QtGui.QFont("Candara Light", 10, QtGui.QFont.Bold)
+            self.setFont(font)
+
+            self.tabs = QTabWidget()
+            self.setCentralWidget(self.tabs)
+
+            self.Room1Tab = QWidget()
+            self.Room2Tab = QWidget()
+            self.AccelTab = QWidget()
+
+            self.tabs.addTab(self.Room1Tab, "Room 1")
+            self.tabs.addTab(self.Room2Tab, "Room 2")
+            self.tabs.addTab(self.AccelTab, "Accelerometer")
+
+            self.layout1 = QGridLayout()
+            self.layout2 = QGridLayout()
+            self.layout3 = QGridLayout()
+
+            self.Room1Tab.setLayout(self.layout1)
+            self.Room2Tab.setLayout(self.layout2)
+            self.AccelTab.setLayout(self.layout3)
+
+            self.fig_motionA, self.canvas_motionA = self.create_plot("Motion Data 1", 'Motion State')
+            self.fig_motionB, self.canvas_motionB = self.create_plot("Motion Data 2", 'Motion State')
+            self.fig_tempA, self.canvas_tempA = self.create_plot("Temperature Data 1", 'Temperature (°C)')
+            self.fig_tempB, self.canvas_tempB = self.create_plot("Temperature Data 2", 'Temperature (°C)')
+            self.fig_humidityA, self.canvas_humidityA = self.create_plot("Humidity Data 1", 'Humidity (%RH)')
+            self.fig_humidityB, self.canvas_humidityB = self.create_plot("Humidity Data 2", 'Humidity (%RH)')
+            self.fig_accel, self.canvas_accel = self.create_plot("Acceleration (m/s²)", 'Acceleration (m/s²)')
+            self.fig_atotal, self.canvas_atotal = self.create_plot("Total Acceleration", 'Atotal (m/s²)')
+            self.fig_angles, self.canvas_angles = self.create_plot("Angles (°)", 'Angle (°)')
+            self.fig_angle_total, self.canvas_angle_total = self.create_plot("Total Angle (°)", 'Angle Total (°)')
+
+            self.layout1.addWidget(self.canvas_motionA, 0, 0)
+            self.layout1.addWidget(self.canvas_tempA, 0, 1)
+            self.layout1.addWidget(self.canvas_humidityA, 1, 0)
+
+            self.layout2.addWidget(self.canvas_motionB, 0, 0)
+            self.layout2.addWidget(self.canvas_tempB, 0, 1)
+            self.layout2.addWidget(self.canvas_humidityB, 1, 0)
+
+            self.layout3.addWidget(self.canvas_accel, 0, 0)
+            self.layout3.addWidget(self.canvas_atotal, 0, 1)
+            self.layout3.addWidget(self.canvas_angles, 1, 0)
+            self.layout3.addWidget(self.canvas_angle_total, 1, 1)
+
+            reader_a.dataSignal.connect(self.updateData)
+            reader_b.dataSignal.connect(self.updateData)
+            accel_reader.sensorSignal.connect(self.updateSensorData)
+
+            self.timer = QTimer()
+            self.timer.timeout.connect(self.updateGraph)
+            self.timer.start(100)  # Reduced to 100 ms for faster updates
+
+            self.daily_timer = QTimer()
+            self.daily_timer.timeout.connect(self.check_time_for_export)
+            self.daily_timer.start(60000)
+        except Exception as e:
+            print(f"[MainWindow Init Error] {e}")
+            raise
+
+    def create_plot(self, title, ylabel):
+        fig = plt.Figure(figsize=(5, 3), dpi=100)
+        ax = fig.add_subplot(111)
+        ax.set_title(title, fontsize=12)
+        ax.set_xlabel('Time (s)', fontsize=10)
+        ax.set_ylabel(ylabel, fontsize=10)
+        ax.grid(True)
+        if "Acceleration" in title:
+            ax.set_ylim(-20, 20)
+        elif "Total Acceleration" in title:
+            ax.set_ylim(0, 20)
+        elif "Angles" in title:
+            ax.set_ylim(-180, 180)
+        elif "Total Angle" in title:
+            ax.set_ylim(0, 360)
+        canvas = FigureCanvas(fig)
+        return fig, canvas
+
+    def update_plot(self, fig, canvas, x, *ys):
+        ax = fig.axes[0]
+        original_title = ax.get_title()
+        ax.clear()
+        ax.set_title(original_title, fontsize=12)
+        ax.set_xlabel('Time (s)', fontsize=10)
+        ax.set_ylabel(fig.axes[0].get_ylabel(), fontsize=10)
+        ax.grid(True)
+        if "Acceleration" in original_title:
+            ax.set_ylim(-20, 20)
+            labels = ['Ax', 'Ay', 'Az']
+            for y, label in zip(ys, labels):
+                ax.plot(x, y, label=label)
+            ax.legend()
+        elif "Angles" in original_title:
+            ax.set_ylim(-180, 180)
+            labels = ['Roll', 'Pitch', 'Yaw']
+            for y, label in zip(ys, labels):
+                ax.plot(x, y, label=label)
+            ax.legend()
+        elif "Total Angle" in original_title:
+            ax.set_ylim(0, 360)
+            ax.plot(x, ys[0], label='Angle Total')
+            ax.legend()
+        else:
+            ax.plot(x, ys[0])
+        canvas.draw()
+
+    def updateData(self, newData, device_name):
+        global motionA, motionB, tempA, tempB, humidityA, humidityB
+        try:
+            if "Motion:" in newData:
+                # Extract the motion value (1 or 0) after "Motion:"
+                motionStatus = int(newData.split("Motion:")[1].strip())
+                print(f"[Parsed Motion] Device: {device_name}, Value: {motionStatus}")  # Debug print
+                if device_name == "ESP32A":
+                    motionA.append((time.time(), motionStatus))
+                    if len(motionA) > 50:
+                        motionA.pop(0)
+                elif device_name == "ESP32B":
+                    motionB.append((time.time(), motionStatus))
+                    if len(motionB) > 50:
+                        motionB.pop(0)
+            elif "Temperature:" in newData:
+                tempVal = float(newData.split("Temperature:")[1].strip().replace("°C", ""))
+                if device_name == "ESP32A":
+                    tempA.append((time.time(), tempVal))
+                    if len(tempA) > 50:
+                        tempA.pop(0)
+                elif device_name == "ESP32B":
+                    tempB.append((time.time(), tempVal))
+                    if len(tempB) > 50:
+                        tempB.pop(0)
+            elif "Humidity:" in newData:
+                humidityVal = float(newData.split("Humidity:")[1].strip().replace("%RH", ""))
+                if device_name == "ESP32A":
+                    humidityA.append((time.time(), humidityVal))
+                    if len(humidityA) > 50:
+                        humidityA.pop(0)
+                elif device_name == "ESP32B":
+                    humidityB.append((time.time(), humidityVal))
+                    if len(humidityB) > 50:
+                        humidityB.pop(0)
+        except Exception as e:
+            print(f"[updateData Error] {e}")
+
+    def updateSensorData(self, ax, ay, az, atotal, roll, pitch, yaw, angle_total):
+        global accel_data
+        accel_data.append((time.time(), ax, ay, az, atotal, roll, pitch, yaw, angle_total))
+        if len(accel_data) > 50:
+            accel_data.pop(0)
+
+    def updateGraph(self):
+        try:
+            if motionA:
+                x = [t[0] - motionA[0][0] for t in motionA]
+                y = [t[1] for t in motionA]
+                print(f"[Updating MotionA] Time: {x[-1]:.2f}, Value: {y[-1]}")  # Debug print
+                self.update_plot(self.fig_motionA, self.canvas_motionA, x, y)
+            if motionB:
+                x = [t[0] - motionB[0][0] for t in motionB]
+                y = [t[1] for t in motionB]
+                print(f"[Updating MotionB] Time: {x[-1]:.2f}, Value: {y[-1]}")  # Debug print
+                self.update_plot(self.fig_motionB, self.canvas_motionB, x, y)
+            if tempA:
+                x = [t[0] - tempA[0][0] for t in tempA]
+                y = [t[1] for t in tempA]
+                self.update_plot(self.fig_tempA, self.canvas_tempA, x, y)
+            if tempB:
+                x = [t[0] - tempB[0][0] for t in tempB]
+                y = [t[1] for t in tempB]
+                self.update_plot(self.fig_tempB, self.canvas_tempB, x, y)
+            if humidityA:
+                x = [t[0] - humidityA[0][0] for t in humidityA]
+                y = [t[1] for t in humidityA]
+                self.update_plot(self.fig_humidityA, self.canvas_humidityA, x, y)
+            if humidityB:
+                x = [t[0] - humidityB[0][0] for t in humidityB]
+                y = [t[1] for t in humidityB]
+                self.update_plot(self.fig_humidityB, self.canvas_humidityB, x, y)
+            if accel_data:
+                x = [t[0] - accel_data[0][0] for t in accel_data]
+                ax_vals = [t[1] for t in accel_data]
+                ay_vals = [t[2] for t in accel_data]
+                az_vals = [t[3] for t in accel_data]
+                atotal_vals = [t[4] for t in accel_data]
+                roll_vals = [t[5] for t in accel_data]
+                pitch_vals = [t[6] for t in accel_data]
+                yaw_vals = [t[7] for t in accel_data]
+                angle_total_vals = [t[8] for t in accel_data]
+                self.update_plot(self.fig_accel, self.canvas_accel, x, ax_vals, ay_vals, az_vals)
+                self.update_plot(self.fig_atotal, self.canvas_atotal, x, atotal_vals)
+                self.update_plot(self.fig_angles, self.canvas_angles, x, roll_vals, pitch_vals, yaw_vals)
+                self.update_plot(self.fig_angle_total, self.canvas_angle_total, x, angle_total_vals)
+        except Exception as e:
+            print(f"[updateGraph Error] {e}")
+
+    def save_data_to_csv(self):
+        try:
+            from pathlib import Path
+            save_dir = Path(r"C:\GUI development\Patient Smart Home Data")
+            save_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = time.strftime("%Y-%m-%d")
+            pd.DataFrame(tempA, columns=["Time", "Temperature"]).to_csv(save_dir / f"tempA_{timestamp}.csv", index=False)
+            pd.DataFrame(tempB, columns=["Time", "Temperature"]).to_csv(save_dir / f"tempB_{timestamp}.csv", index=False)
+            pd.DataFrame(motionA, columns=["Time", "Motion Detected"]).to_csv(save_dir / f"motionA_{timestamp}.csv", index=False)
+            pd.DataFrame(motionB, columns=["Time", "Motion Detected"]).to_csv(save_dir / f"motionB_{timestamp}.csv", index=False)
+            pd.DataFrame(humidityA, columns=["Time", "Humidity"]).to_csv(save_dir / f"humidityA_{timestamp}.csv", index=False)
+            pd.DataFrame(humidityB, columns=["Time", "Humidity"]).to_csv(save_dir / f"humidityB_{timestamp}.csv", index=False)
+            pd.DataFrame(accel_data, columns=["Time", "Ax", "Ay", "Az", "Atotal", "Roll", "Pitch", "Yaw", "AngleTotal"]).to_csv(save_dir / f"sensor_data_{timestamp}.csv", index=False)
+            print(f"Daily data saved to {save_dir}")
+        except Exception as e:
+            print(f"[save_data_to_csv Error] {e}")
+
+    def check_time_for_export(self):
+        try:
+            current_time = time.strftime("%H:%M")
+            if current_time == "00:00":
+                self.save_data_to_csv()
+        except Exception as e:
+            print(f"[check_time_for_export Error] {e}")
+
+    def closeEvent(self, event):
+        print("[MainWindow] Closing application")
+        self.timer.stop()
+        self.daily_timer.stop()
+        event.accept()
+
+if __name__ == "__main__":
+    try:
+        print("[Main] Starting application")
+        app = QApplication(sys.argv)
+        reader_a = SerialReaderThread(ESP32A_PORT, "ESP32A")
+        reader_b = SerialReaderThread(ESP32B_PORT, "ESP32B")
+        accel_reader = AccelerometerReaderThread(ACCEL_PORT)
+        window = MainWindow(reader_a, reader_b, accel_reader)
+        window.show()
+        reader_a.start()
+        reader_b.start()
+        accel_reader.start()
+        ret = app.exec_()
+        print("[Main] Stopping threads")
+        reader_a.stop()
+        reader_b.stop()
+        accel_reader.stop()
+        window.save_data_to_csv()
+        print("[Main] Application exited")
+        sys.exit(ret)
+    except serial.SerialException as e:
+        print(f"[Main Serial Error] Serial port issue: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[Main Error] {e}")
+        sys.exit(1)
